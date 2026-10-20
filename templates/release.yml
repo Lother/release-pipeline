@@ -1,0 +1,43 @@
+# Copy into each source repo as .github/workflows/release.yml.
+# Triggered by scripts/release.py after it pushes the tag.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish (vMAJOR.MINOR.PATCH)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Replace with the project's real build. Artifacts go to dist/.
+      - name: Build
+        run: |
+          mkdir -p dist
+          git archive --format=zip -o "dist/${GITHUB_REPOSITORY#*/}-${{ inputs.tag }}.zip" HEAD
+
+      # Fail-closed scan of what is about to be published.
+      # NEEDLES is a repository or org secret, one needle per line.
+      - name: leak-guard
+        env:
+          NEEDLES: ${{ secrets.LEAK_GUARD_NEEDLES }}
+        run: |
+          pip install --quiet git+https://github.com/Lother/leak-guard
+          export LEAK_GUARD_NEEDLE_FILE="$RUNNER_TEMP/needles.txt"
+          printf '%s\n' "$NEEDLES" > "$LEAK_GUARD_NEEDLE_FILE"
+          leak-guard files dist/*
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ inputs.tag }}" dist/* --title "${{ inputs.tag }}" --generate-notes

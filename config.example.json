@@ -1,0 +1,8 @@
+{
+  "feed": "feed.json",
+  "app_owner": "your-org",
+  "repos": [
+    { "name": "tool-a", "repo": "your-org/tool-a" },
+    { "name": "tool-b", "repo": "your-org/tool-b" }
+  ]
+}

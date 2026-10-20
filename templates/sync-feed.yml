@@ -1,0 +1,94 @@
+# Copy into the feed repository as .github/workflows/sync-feed.yml (needs config.json at the root).
+# Scheduled sync: record every source repo's latest release in feed.json.
+# Publishing (scripts/release.py) never waits on CI; this workflow catches up.
+name: sync-feed
+
+on:
+  schedule:
+    # Every 15 minutes, offset from :00/:15/:30/:45 where GitHub's scheduler is busiest.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+# Queue, never cancel: a cancelled run silently drops one sync.
+concurrency:
+  group: sync-feed
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # One job and no job-level `if:`. A skipped job looks the same as a success
+  # in `gh run list`; skip steps, not jobs.
+  sync:
+    # GitHub-hosted is fine for public repos. For private repos a 15-minute
+    # schedule (~2,880 runs/month) exhausts the free minutes; use a self-hosted
+    # runner and allow private repos in its runner group.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Latest main, not the commit the run was queued on: an earlier queued
+          # run may already have pushed a newer feed.
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: pip install --quiet cryptography
+
+      - name: Sync releases
+        id: sync
+        env:
+          # Org/user secrets. With private source repos the default GITHUB_TOKEN
+          # only covers this repo, so a GitHub App token is required. Note that an
+          # org secret with "private repositories" visibility reads as an empty
+          # string in a public repo.
+          RP_APP_ID: ${{ secrets.RP_APP_ID }}
+          RP_APP_KEY: ${{ secrets.RP_APP_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # No `set -e`: the exit code is graded by the next step.
+          set -uo pipefail
+          python scripts/sync_feed.py --config config.json 2>&1 | tee sync.log
+          # With a pipe, $? is tee's (always 0); PIPESTATUS[0] is python's.
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Grade (warn continues, FAIL stops)
+        run: |
+          set -uo pipefail
+          rc="${{ steps.sync.outputs.rc }}"
+          # An unset rc (previous step died) is "" which is != 0: fail safe.
+          if [ "$rc" != "0" ]; then
+            echo "::error title=sync hard failure::sync_feed.py exit '$rc'; feed not written (see run summary)"
+            exit 1
+          fi
+          # Reverse check: exit 0 but a line-start [FAIL] means the grading has a hole.
+          if grep -n '^\[FAIL\]' sync.log; then
+            echo "::error title=grading mismatch::exit 0 but [FAIL] lines in output"
+            exit 1
+          fi
+          if grep -q '^\[warn\]' sync.log; then
+            echo "::notice title=sync has warnings::not all green; see run summary"
+          fi
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git add feed.json
+          if git diff --cached --quiet; then
+            echo "No new releases." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync feed"
+          # Someone else may push to main at the same time: rebase and retry.
+          for attempt in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          echo "::error title=push failed 3 times::feed not updated"
+          exit 1
